@@ -50,6 +50,42 @@ the collection. When we find a minion, return only the ``customer_id``,
 want for a given node. They will be available directly inside the ``pillar``
 dict in your SLS templates.
 
+If one wishes to use the ``aggregate`` key, the ``fields`` key will be ignored.
+Below is an example of an aggregate query that could be used.
+
+ ext_pillar:
+   - mongo: {collection: minions, id_field: _id, aggregate: [{"$match": {"_id": "Master-Minion"}},{"$lookup": {"from": "clients","localField":"Client","foreignField": "_id","as": "Client"}},{"$unset": ["Client._id",]},{"$project": {"name": 1,"Client": {"$arrayElemAt":["$Client",0]}}}]}
+
+The above example pulls external grains from a mongodb. Note the operators such
+as ``$match``, ``$project``, ``$lookup``, etc must all be doucle quoted. The above
+example is functionally the same as running the below query for a minion by name.
+
+db.minions.aggregate([
+  {$match: {
+    "_id": "Master-Minion"
+  }},
+  {$lookup: {
+    from: "clients",
+    localField:"Client",
+    foreignField: "_id",
+    as: "Client"
+  }},
+  {$unset: [
+    "Client._id",
+    "General_Config._id",
+    "Role_Config._id"
+  ]},
+  {$project: {
+      name: 1,
+      Client: {$arrayElemAt:["$Client",0]}
+    }
+  }
+])
+
+As one can see a ``match`` statement will be applied to the beginning of the query
+statement before running. The ``match`` statement can be tweaked to change the
+field that will be mached against, in this case the monogodb ``_id`` is the
+field containing the minion names.
 
 Module Documentation
 ====================
@@ -62,37 +98,100 @@ import re
 
 # Import third party libs
 from salt.ext import six
+
 try:
     import pymongo
+
     HAS_PYMONGO = True
 except ImportError:
     HAS_PYMONGO = False
 
+__opts__ = {
+    'mongo.db': 'salt',
+    'mongo.host': 'salt',
+    'mongo.password': '',
+    'mongo.port': 27017,
+    'mongo.user': '',
+}
 
-__opts__ = {'mongo.db': 'salt',
-            'mongo.host': 'salt',
-            'mongo.password': '',
-            'mongo.port': 27017,
-            'mongo.user': ''}
+log = logging.getLogger(__name__)
 
 
 def __virtual__():
     if not HAS_PYMONGO:
         return False
-    return 'mongo'
+    return "mongo"
 
 
-# Set up logging
-log = logging.getLogger(__name__)
+def get_connection(host, port):
+    log.info("connecting to %s:%s for mongo ext_pillar", host, port)
+    conn = pymongo.MongoClient(host, port)
+    return conn
 
 
-def ext_pillar(minion_id,
-               pillar,  # pylint: disable=W0613
-               collection='pillar',
-               id_field='_id',
-               re_pattern=None,
-               re_replace='',
-               fields=None):
+def authenticate_connection(mdb, user, password):
+    log.debug("authenticating as '%s'", user)
+    mdb.authenticate(user, password)
+    return mdb
+
+
+def get_find_one(mdb, collection, id_field, minion_id, fields):
+    result = mdb[collection].find_one({id_field: minion_id}, projection=fields)
+    if result:
+        if fields:
+            log.debug(
+                "ext_pillar.mongo: found document, returning fields '%s'", fields
+            )
+        else:
+            log.debug("ext_pillar.mongo: found document, returning whole doc")
+        if "_id" in result:
+            # Converting _id to a string
+            # will avoid the most common serialization error cases, but DBRefs
+            # and whatnot will still cause problems.
+            result["_id"] = six.text_type(result["_id"])
+        return result
+    else:
+        # If we can't find the minion the database it's not necessarily an
+        # error.
+        log.debug(
+            "ext_pillar.mongo: no document found in collection %s", collection
+        )
+        return {}
+
+
+def get_aggregate(mdb, collection, id_field, minion_id, aggregate):
+    pipeline = []
+    pipeline.append({"$match": {id_field: minion_id}})
+    for pipe in aggregate:
+        pipeline.append(pipe)
+    results = mdb[collection].aggregate(pipeline)
+    if results:
+        # Drop the cursor and get the list
+        results = list(results)
+        if len(results) == 0:
+            log.error("ext_pillar.mongo: pipeline returned no results")
+            return {}
+        elif len(results) > 1:
+            # More than one item was returned in the list.
+            log.error("ext_pillar.mongo: pipeline returned more than one result")
+        else:
+            # A single result was returned, so return inex 0 of the list.
+            return results[0]
+    else:
+        log.debug("ext_pillar.mongo: no response from pipeline %s", collection)
+        return {}
+
+
+def ext_pillar(
+    minion_id,
+    pillar,  # pylint: disable=W0613
+    collection='pillar',
+    id_field='_id',
+    re_pattern=None,
+    re_replace='',
+    fields=None,
+    aggregate=None,
+):
     '''
     Connect to a mongo database and read per-node pillar information.
 
@@ -115,51 +214,32 @@ def ext_pillar(minion_id,
           entire document, the ``_id`` field will be converted to string. Be
           careful with other fields in the document as they must be string
           serializable. Defaults to ``None``.
+        * `aggregate`: The aggregate query to run, do note query operators
+          must be quoted and the fields, argument will be ignored if also
+          supplied.
     '''
-    host = __opts__['mongo.host']
-    port = __opts__['mongo.port']
-    log.info('connecting to %s:%s for mongo ext_pillar', host, port)
-    conn = pymongo.MongoClient(host, port)
-
-    log.debug('using database \'%s\'', __opts__['mongo.db'])
+    # Get connection to DB
+    conn = get_connection(__opts__['mongo.host'], __opts__['mongo.port'])
+    # Select database to use
+    log.debug("using database '%s'", __opts__['mongo.db'])
     mdb = conn[__opts__['mongo.db']]
-
-    user = __opts__.get('mongo.user')
-    password = __opts__.get('mongo.password')
-
-    if user and password:
-        log.debug('authenticating as \'%s\'', user)
-        mdb.authenticate(user, password)
-
+    # Authenticate if needed
+    if __opts__['mongo.user'] and __opts__['mongo.password']:
+        mdb = authenticate_connection(
+            mdb, __opts__['mongo.user'], __opts__['mongo.password']
+        )
     # Do the regex string replacement on the minion id
     if re_pattern:
         minion_id = re.sub(re_pattern, re_replace, minion_id)
 
     log.info(
-        'ext_pillar.mongo: looking up pillar def for {\'%s\': \'%s\'} '
-        'in mongo', id_field, minion_id
+        "ext_pillar.mongo: looking up pillar def for {'%s': '%s'} in mongo",
+        id_field,
+        minion_id,
     )
-
-    result = mdb[collection].find_one({id_field: minion_id}, projection=fields)
-    if result:
-        if fields:
-            log.debug(
-                'ext_pillar.mongo: found document, returning fields \'%s\'',
-                fields
-            )
-        else:
-            log.debug('ext_pillar.mongo: found document, returning whole doc')
-        if '_id' in result:
-            # Converting _id to a string
-            # will avoid the most common serialization error cases, but DBRefs
-            # and whatnot will still cause problems.
-            result['_id'] = six.text_type(result['_id'])
+    if aggregate is None:
+        result = get_find_one(mdb, collection, id_field, minion_id, fields)
         return result
     else:
-        # If we can't find the minion the database it's not necessarily an
-        # error.
-        log.debug(
-            'ext_pillar.mongo: no document found in collection %s',
-            collection
-        )
-        return {}
+        result = get_aggregate(mdb, collection, id_field, minion_id, aggregate)
+        return result
